@@ -24,20 +24,11 @@ services:
       HOST: 0.0.0.0
       PORT: "8080"
       LOG_LEVEL: INFO
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
       BOT_DB_PATH: /app/data/bot-memory.sqlite3
-      PROFILE_EVERY_N_MESSAGES: "12"
-      GROUP_COOLDOWN_SECONDS: "12"
-      CASUAL_REPLY_PROBABILITY: "0.25"
       ONEBOT_V11_ACCESS_TOKEN: ${BOT_ACCESS_TOKEN}
       ONEBOT_V11_WS_URLS: '["ws://napcat:3001"]'
-      BOT_NAME: ""
-      BOT_ALIASES: ""
-      BOT_TZ: "Asia/Shanghai"
     volumes:
       - ./stickers:/app/stickers
-      - ./bot/.env.prod:/app/.env.prod:ro
       - ./data/bot:/app/data
     depends_on:
       - napcat

@@ -1,11 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
-"""
-@Project ：smart_qq_bot 
-@File ：bot.py
-@Author ：zlh
-@Date ：2026-11-02 20:12 
-"""
 """bot.py — QQ 群聊机器人（NoneBot2 + OneBot V11 + DeepSeek）
 
 设计原则：
@@ -172,7 +164,7 @@ BOT_OWNER = os.getenv("BOT_OWNER", "").strip()
 # 看图：DeepSeek 文本模型看不了图，这里默认用智谱的免费多模态 glm-4v-flash
 VISION_MODEL = os.getenv("VISION_MODEL", "glm-4v-flash").strip()
 VISION_BASE_URL = os.getenv("VISION_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/").strip()
-VISION_API_KEY = os.getenv("VISION_API_KEY", "").strip()
+VISION_API_KEY = os.getenv("VISION_API_KEY", "de50373b245d44ca86a6750e19d6b7c2.fB6QoibvRNix0uIC").strip()
 
 # 没有冷却、没有额度、没有静默时段：默认每条都回。
 GATE = GateConfig(
@@ -321,11 +313,11 @@ async def collect_sticker(url: str, caption: str = "") -> Path | None:
     except Exception as exc:
         logger.warning("收录失败，下载不了：{}（{}）", exc, url[:60])
         return None
-    if not raw or len(raw) > 2_000_000:
+    if not raw or len(raw) > 3_000_000:
         return None
     if raw[:4] == b"GIF8":
-        return None  # 动图不收：体积大、发出去也容易糊
-    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = ".gif"  # 动图也收：发出去还是动的，看图时取第一帧
+    elif raw[:8] == b"\x89PNG\r\n\x1a\n":
         ext = ".png"
     elif raw[:2] == b"\xff\xd8":
         ext = ".jpg"
@@ -410,6 +402,61 @@ def _fetch_bytes(url: str) -> bytes:
         return resp.read(4_000_000)
 
 
+_CAPTION_PROMPT = (
+    "用一句中文描述这张表情包：画面是什么、什么情绪，"
+    "20 字以内，不要客套，不要“这是一张”开头。"
+)
+_FRAMES_PROMPT = (
+    "这是一张动图按时间顺序抽的 {n} 帧。用一句中文说出它表达的梗或情绪，"
+    "20 字以内，不要客套，不要逐帧描述。"
+)
+
+
+def _extract_frames(raw: bytes, count: int = 3) -> list[bytes]:
+    """从动图里均匀抽几帧，转成 JPEG。没装 Pillow 或不是动图就返回空。"""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as im:
+            total = int(getattr(im, "n_frames", 1) or 1)
+            if total <= 1:
+                return []
+            index = sorted({0, total // 2, total - 1})[:count]
+            frames: list[bytes] = []
+            for idx in index:
+                im.seek(idx)
+                frame = im.convert("RGB")
+                frame.thumbnail((384, 384))  # 多帧要走体积，别太大
+                out = io.BytesIO()
+                frame.save(out, format="JPEG", quality=75)
+                frames.append(out.getvalue())
+            return frames
+    except Exception:
+        return []
+
+
+def _data_url(payload: bytes, mime: str = "image/jpeg") -> str:
+    return f"data:{mime};base64,{base64.b64encode(payload).decode()}"
+
+
+async def _vision_request(images: list[str], prompt: str) -> str:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for image in images:
+        content.append({"type": "image_url", "image_url": {"url": image}})
+    async with vision_semaphore:
+        resp = await asyncio.wait_for(
+            vision_client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=80,
+            ),
+            timeout=25,
+        )
+    return (resp.choices[0].message.content or "").strip().replace("\n", " ")[:40]
+
+
 async def describe_image(url: str) -> str:
     """用多模态模型说一句这张图/表情包是什么。没配 VISION_API_KEY 就返回空。"""
     if not url or vision_client is None:
@@ -423,53 +470,49 @@ async def describe_image(url: str) -> str:
     except Exception as exc:
         logger.warning("图片下载失败：{}（{}）", exc, url[:60])
         return ""
-    if raw[:4] == b"GIF8":  # 动图很多模型看不了，直接当普通表情包
-        logger.info("动图跳过看图")
-        return ""
-    b64 = base64.b64encode(raw).decode()
 
-    async def _call(image_field: str) -> str:
-        async with vision_semaphore:
-            resp = await asyncio.wait_for(
-                vision_client.chat.completions.create(
-                    model=VISION_MODEL,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "用一句中文描述这张表情包：画面是什么、什么情绪，"
-                                        "20 字以内，不要客套，不要“这是一张”开头。"
-                                    ),
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": image_field},
-                                },
-                            ],
-                        }
-                    ],
-                    max_tokens=60,
-                ),
-                timeout=25,
+    # 按优先级准备几种问法，模型不吃就换下一种
+    attempts: list[tuple[list[str], str]] = []
+    if raw[:4] == b"GIF8":
+        frames = await asyncio.to_thread(_extract_frames, raw, 3)
+        if len(frames) >= 2:
+            attempts.append(
+                (
+                    [_data_url(f) for f in frames],
+                    _FRAMES_PROMPT.format(n=len(frames)),
+                )
             )
-        return (resp.choices[0].message.content or "").strip().replace("\n", " ")[:40]
+        elif frames:
+            attempts.append(([_data_url(frames[0])], _CAPTION_PROMPT))
+        else:
+            logger.info("动图抽帧失败（没装 Pillow？），退回整图试一次")
+        attempts.append(([_data_url(raw, "image/gif")], _CAPTION_PROMPT))
+    else:
+        attempts.append(([_data_url(raw)], _CAPTION_PROMPT))
 
-    try:
-        text = await _call(f"data:image/jpeg;base64,{b64}")
-    except Exception:
+    text = ""
+    for images, prompt in attempts:
         try:
-            # 有些接口（比如智谱）直接吃裸 base64，不吃 data: 前缀
-            text = await _call(b64)
+            text = await _vision_request(images, prompt)
         except Exception:
-            logger.exception("视觉模型调用失败")
-            return ""
+            try:
+                # 有些接口（比如智谱）直接吃裸 base64，不吃 data: 前缀
+                text = await _vision_request(
+                    [img.split(",", 1)[-1] for img in images], prompt
+                )
+            except Exception:
+                logger.warning("视觉模型不吃这种输入（{} 张图），换下一种问法", len(images))
+                continue
+        if text:
+            break
+
+    if not text:
+        logger.warning("看图失败：所有格式都不行")
+        return ""
     if len(_caption_cache) > 500:
         _caption_cache.clear()
     _caption_cache[key] = text
-    logger.info("看图结果：{}", text or "（模型没返回）")
+    logger.info("看图结果：{}", text)
     return text
 
 
@@ -895,7 +938,12 @@ def build_msg(event: MessageEvent) -> Msg:
                 media_url = str(seg.data.get("url") or "")
             summary = str(seg.data.get("summary") or "")
             sub_type = str(seg.data.get("sub_type") or seg.data.get("subType") or "")
-            if sub_type == "1" or summary in {"[动画表情]", "[表情]"}:
+            filename = str(seg.data.get("file") or "")
+            if (
+                sub_type == "1"
+                or summary in {"[动画表情]", "[表情]"}
+                or filename.lower().endswith(".gif")
+            ):
                 media_kind = "sticker"
             elif not media_kind:
                 media_kind = "image"

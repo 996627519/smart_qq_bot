@@ -35,6 +35,10 @@
 | 看懂动图 | 本地抽 3 帧，一次请求发给模型 |
 | 长期记忆 | 外号表、长期备忘、原文库按名字召回 |
 | 自动学群梗 | 每 40 条消息提炼一次黑话/固定玩笑 |
+| 情绪状态 | 有心情和精力，会被夸、被凶、被深夜影响；每条回复前先看状态 |
+| 场景切换 | 自动分辨安慰 / 认真 / 冲突 / 玩笑 / 深夜，换对应语气 |
+| 联网搜索 | 有人问推荐、价格、新闻时先搜一下，再给带自己判断的回答 |
+| 自言自语 | 群里长时间没人说话时，偶尔自己冒一句 |
 | 命令 | `/状态`、`/问`、`/记住我`、`/忘记我` |
 
 ---
@@ -132,6 +136,10 @@ PERSONA_STYLE=whale
 VISION_MODEL=glm-4v-flash
 VISION_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 VISION_API_KEY=你的智谱key
+
+# ---- 联网搜索（推荐 Tavily，有免费额度）----
+SEARCH_PROVIDER=tavily
+SEARCH_API_KEY=tvly-你的key
 
 # ---- NapCat ----
 BOT_ACCESS_TOKEN=随便一串随机字符串
@@ -269,6 +277,32 @@ docker compose restart napcat
 | `MULTI_MSG_MAX` | `3` | 一次最多几条 |
 | `ALLOW_PRIVATE_CHAT` | `1` | 私聊能不能闲聊 |
 | `ALLOW_GROUP_ASK` | `0` | `/问` 是否允许在群里用 |
+| `SELFTALK_ENABLED` | `1` | 群里长时间没人时自己冒一句 |
+| `SELFTALK_RATE` | `0.12` | 每次检查时开口的概率 |
+| `SELFTALK_IDLE_SECONDS` | `2700` | 安静多久才考虑自言自语 |
+| `SELFTALK_GAP_SECONDS` | `5400` | 两次自言自语至少隔多久 |
+
+### 联网搜索
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SEARCH_ENABLED` | `1` | 总开关 |
+| `SEARCH_PROVIDER` | `bing` | `tavily`（推荐）/ `bocha` / `bing`（免 key）/ `searxng` |
+| `SEARCH_API_KEY` | 空 | tavily / bocha 需要 |
+| `SEARCH_BASE_URL` | 空 | searxng 的地址，如 `http://searxng:8080` |
+| `SEARCH_COOLDOWN_SECONDS` | `120` | 同一个群两次搜索的最小间隔 |
+
+只有消息里出现"推荐/哪个好/多少钱/测评/最新/查一下"这类词才会搜，
+日常闲聊不会，省时间也省钱。
+
+**推荐用 Tavily**：它除了链接，还会返回一段合成摘要，模型可以直接拿去改写成自己的话。
+配上之后日志会显示 `（有摘要）`：
+
+```
+搜索「四川火锅店 推荐」→ 5 条（有摘要）｜首条：成都火锅推荐
+```
+
+`bing` 是抓网页，不要 key 但页面结构一变就失效，只适合临时用。
 
 ### 表情包与看图
 
@@ -370,6 +404,18 @@ docker compose exec bot python -c "import socket;socket.create_connection(('napc
 ### 它一直重复同一句话
 
 `CHAT_TEMPERATURE` 调高到 1.4，或者把 `MULTI_MSG_RATE` 降下来减少复读概率。
+如果它总是同一种语气，多半是心情被卡在同一个状态：`/状态` 里看 `心情`，
+重启一次会重新掷初值；也可以在 `persona.py` 的 `WHALE_FEWSHOT` 里补两条不同语气的例子。
+
+### 搜索没反应
+
+| 现象 | 原因 |
+| --- | --- |
+| 日志里没有 `搜索「…」` | 消息没命中关键词（只有推荐/价格/测评这类才搜） |
+| `搜索失败（bing）` | 容器出不了网，或者必应改了页面结构 |
+| 想稳定一点 | 换 `SEARCH_PROVIDER=tavily` 或 `bocha`，填 `SEARCH_API_KEY` |
+
+必应是"抓网页"，不需要 key 但不保证一直好使；要稳定就买一个搜索 API。
 
 ---
 

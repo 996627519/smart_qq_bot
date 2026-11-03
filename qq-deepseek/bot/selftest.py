@@ -1,11 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
-"""
-@Project ：smart_qq_bot 
-@File ：selftest.py
-@Author ：zlh
-@Date ：2026-11-02 20:16 
-"""
 """selftest.py — 不连 QQ、不花钱，直接看"什么话它接、什么话它闭嘴、接成什么样"。
 
 用法：python selftest.py
@@ -29,6 +21,7 @@ from persona import (
     Msg,
     build_messages,
     clean_reply,
+    current_style,
     decide,
     is_duplicate,
     local_tz,
@@ -67,12 +60,10 @@ def run_script() -> None:
         Msg(ts=START - 120, user_id="20002", nickname="阿祖", text="今晚有人开黑吗"),
         Msg(ts=START - 60, user_id="20003", nickname="小圆", text="我来 等我吃完饭"),
     ]
-    last_bot_reply = -1e9
-    reply_times: list[float] = []
     now = START
 
     print("=" * 78)
-    print("发言决策回放（cfg 用 persona.py 默认值，随机种子固定）")
+    print(f"发言决策回放（人格 {current_style().key}，默认每条都回）")
     print("=" * 78)
     for gap, nick, uid, text, at_bot in SCRIPT:
         now += gap
@@ -85,35 +76,27 @@ def run_script() -> None:
             msg_id=f"m{len(history)}",
         )
         history.append(msg)
-        recent = history[-40:]
-        decision = decide(
-            msg,
-            recent,
-            now=now,
-            cfg=cfg,
-            last_bot_reply=last_bot_reply,
-            reply_times=reply_times,
-            bot_id=BOT_ID,
-            bot_names=BOT_NAMES,
-            rng=rng,
-        )
+        decision = decide(msg, cfg=cfg, bot_id=BOT_ID, rng=rng)
         mark = "说" if decision.should else "  "
         stamp = datetime.fromtimestamp(now, TZ).strftime("%H:%M")
         print(f"{stamp} [{mark}] {nick}：{text}   -> {decision.reason}")
 
         if decision.should:
-            reply = "……（这里省略模型生成）"
             history.append(
-                Msg(ts=now + 3, user_id=BOT_ID, nickname="小号", text=reply, is_self=True)
+                Msg(
+                    ts=now + 3,
+                    user_id=BOT_ID,
+                    nickname="小号",
+                    text="……（这里省略模型生成）",
+                    is_self=True,
+                )
             )
-            last_bot_reply = now + 3
-            reply_times.append(now + 3)
 
 
 def run_clean() -> None:
     print()
     print("=" * 78)
-    print("输出清洗")
+    print(f"输出清洗（人格 {current_style().key}）")
     print("=" * 78)
     samples = [
         "作为一个AI，我很乐意帮你分析这个问题～😊",

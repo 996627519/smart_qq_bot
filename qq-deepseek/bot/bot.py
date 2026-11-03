@@ -17,8 +17,10 @@ import hashlib
 import json
 import os
 import random
+import re
 import sqlite3
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
@@ -51,7 +53,10 @@ from persona import (
     is_duplicate,
     local_tz,
     looks_silent,
+    mood_from_event,
+    pick_mode,
     render_context,
+    render_state,
 )
 
 
@@ -164,7 +169,20 @@ BOT_OWNER = os.getenv("BOT_OWNER", "").strip()
 # 看图：DeepSeek 文本模型看不了图，这里默认用智谱的免费多模态 glm-4v-flash
 VISION_MODEL = os.getenv("VISION_MODEL", "glm-4v-flash").strip()
 VISION_BASE_URL = os.getenv("VISION_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/").strip()
-VISION_API_KEY = os.getenv("VISION_API_KEY", "de50373b245d44ca86a6750e19d6b7c2.fB6QoibvRNix0uIC").strip()
+VISION_API_KEY = os.getenv("VISION_API_KEY", "").strip()
+
+# 联网搜索：默认用必应网页版，不需要 key；也可以换 tavily / bocha / searxng
+SEARCH_ENABLED = _env_bool("SEARCH_ENABLED", True)
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "bing").strip().lower()
+SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "").strip()
+SEARCH_BASE_URL = os.getenv("SEARCH_BASE_URL", "").strip()
+SEARCH_COOLDOWN = _env_float("SEARCH_COOLDOWN_SECONDS", 120)
+
+# 自言自语：群里长时间没人说话时，偶尔自己冒一句
+SELFTALK_ENABLED = _env_bool("SELFTALK_ENABLED", True)
+SELFTALK_RATE = min(1.0, max(0.0, _env_float("SELFTALK_RATE", 0.12)))
+SELFTALK_IDLE_SECONDS = _env_float("SELFTALK_IDLE_SECONDS", 2700)
+SELFTALK_GAP_SECONDS = _env_float("SELFTALK_GAP_SECONDS", 5400)
 
 # 没有冷却、没有额度、没有静默时段：默认每条都回。
 GATE = GateConfig(
@@ -516,13 +534,216 @@ async def describe_image(url: str) -> str:
     return text
 
 
+# --------------------------------------------------------------------------- 联网搜索
+
+_SEARCH_HINTS = (
+    "推荐", "哪个好", "哪家", "多少钱", "价格", "值得", "好用", "测评",
+    "对比", "最新", "新闻", "查一下", "搜一下", "怎么回事", "发布了",
+)
+
+
+def need_search(text: str) -> bool:
+    """只有"像在问外部信息"的句子才搜，日常闲聊不搜。"""
+    t = (text or "").strip()
+    if len(t) < 4:
+        return False
+    return any(word in t for word in _SEARCH_HINTS)
+
+
+_FILLER_WORDS = (
+    "帮我", "麻烦", "请问", "能不能", "可不可以", "给我", "推荐一下",
+    "求推荐", "推荐", "有没有", "一下", "哪个好",
+)
+
+
+def clean_query(text: str) -> str:
+    """把"推荐一下四川火锅店"洗成"四川火锅店 推荐"，搜出来的东西才像样。"""
+    q = (text or "").strip()
+    for word in _FILLER_WORDS:
+        q = q.replace(word, " ")
+    q = re.sub(r"[？?！!。，,、~～]+", " ", q)
+    q = re.sub(r"\s{2,}", " ", q).strip()
+    if not q:
+        return (text or "").strip()[:60]
+    if "推荐" in text and "推荐" not in q:
+        q = f"{q} 推荐"
+    return q[:60]
+
+
+def _fetch_text(
+    url: str,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 8.0,
+) -> str:
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            **(headers or {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(1_500_000)
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "ignore")
+
+
+def _search_bing(query: str, limit: int = 4) -> list[dict]:
+    url = "https://cn.bing.com/search?q=" + urllib.parse.quote(query) + "&setlang=zh-CN"
+    html = _fetch_text(url)
+    results: list[dict] = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', html, re.S)[: limit * 2]:
+        match = re.search(
+            r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S
+        )
+        if not match:
+            continue
+        title = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+        snippet_match = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        snippet = (
+            re.sub(r"<[^>]+>", "", snippet_match.group(1)).strip()
+            if snippet_match
+            else ""
+        )
+        if title:
+            results.append(
+                {"title": title[:60], "url": match.group(1), "snippet": snippet[:120]}
+            )
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_tavily(query: str, limit: int = 5) -> dict:
+    """Tavily 会额外给一段合成摘要，比零散片段好用得多。"""
+    payload = json.dumps(
+        {
+            "api_key": SEARCH_API_KEY,
+            "query": query,
+            "search_depth": "basic",
+            "include_answer": "basic",
+            "topic": "general",
+            "max_results": limit,
+        }
+    ).encode()
+    data = json.loads(
+        _fetch_text(
+            "https://api.tavily.com/search",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {SEARCH_API_KEY}",
+            },
+        )
+    )
+    return {
+        "answer": str(data.get("answer") or "").strip()[:400],
+        "results": [
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "snippet": str(item.get("content") or "")[:160],
+            }
+            for item in (data.get("results") or [])[:limit]
+        ],
+    }
+
+
+def _search_bocha(query: str, limit: int = 4) -> list[dict]:
+    payload = json.dumps({"query": query, "count": limit, "summary": True}).encode()
+    data = json.loads(
+        _fetch_text(
+            "https://api.bochaai.com/v1/web-search",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {SEARCH_API_KEY}",
+            },
+        )
+    )
+    pages = ((((data.get("data") or {}).get("webPages")) or {}).get("value")) or []
+    return [
+        {
+            "title": str(item.get("name") or ""),
+            "url": str(item.get("url") or ""),
+            "snippet": str(item.get("snippet") or item.get("summary") or "")[:120],
+        }
+        for item in pages[:limit]
+    ]
+
+
+def _search_searxng(query: str, limit: int = 4) -> list[dict]:
+    base = SEARCH_BASE_URL.rstrip("/")
+    url = f"{base}/search?q={urllib.parse.quote(query)}&format=json&language=zh-CN"
+    data = json.loads(_fetch_text(url))
+    return [
+        {
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "snippet": str(item.get("content") or "")[:120],
+        }
+        for item in (data.get("results") or [])[:limit]
+    ]
+
+
+_PROVIDERS = {
+    "bing": _search_bing,
+    "tavily": _search_tavily,
+    "bocha": _search_bocha,
+    "searxng": _search_searxng,
+}
+
+
+def search_web(query: str, limit: int = 5) -> dict:
+    """统一返回 {"answer": 摘要, "results": [...]}。"""
+    fn = _PROVIDERS.get(SEARCH_PROVIDER, _search_bing)
+    if SEARCH_PROVIDER in {"tavily", "bocha"} and not SEARCH_API_KEY:
+        logger.warning("搜索没配 SEARCH_API_KEY，跳过")
+        return {"answer": "", "results": []}
+    if SEARCH_PROVIDER == "searxng" and not SEARCH_BASE_URL:
+        logger.warning("searxng 没配 SEARCH_BASE_URL，跳过")
+        return {"answer": "", "results": []}
+    try:
+        out = fn(query, limit)
+    except Exception:
+        logger.exception("搜索失败（{}）", SEARCH_PROVIDER)
+        return {"answer": "", "results": []}
+    if isinstance(out, dict):
+        return {"answer": out.get("answer") or "", "results": out.get("results") or []}
+    return {"answer": "", "results": out or []}
+
+
+def format_search(data: dict) -> str:
+    parts: list[str] = []
+    answer = (data or {}).get("answer") or ""
+    if answer:
+        parts.append(f"摘要：{answer}")
+    results = (data or {}).get("results") or []
+    if results:
+        if parts:
+            parts.append("来源：")
+        for index, item in enumerate(results, 1):
+            line = f"{index}. {item.get('title', '')}：{item.get('snippet', '')}".strip("：")
+            if line:
+                parts.append(line)
+    return "\n".join(parts)
+
+
 logger.info(
-    "表情包 {} 张，标签 {}｜看图 {}",
+    "表情包 {} 张，标签 {}｜看图 {}｜搜索 {}",
     sum(len(v) for v in STICKERS.values()),
     "/".join(STICKERS) or "-",
     f"开（{VISION_MODEL}）"
     if vision_client is not None
     else "关（没填 VISION_API_KEY）",
+    SEARCH_PROVIDER if SEARCH_ENABLED else "关",
 )
 
 
@@ -558,6 +779,11 @@ def open_database(path: Path) -> sqlite3.Connection:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages(group_id, ts)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bot_mood ("
+        "group_id TEXT PRIMARY KEY, name TEXT NOT NULL, energy INTEGER NOT NULL, "
+        "reason TEXT NOT NULL, updated REAL NOT NULL)"
     )
     conn.commit()
     return conn
@@ -626,6 +852,75 @@ def load_diary(group_id: str) -> str:
         logger.exception("读取长期记忆失败")
         return ""
     return row[0] if row else ""
+
+
+@dataclass
+class Mood:
+    name: str = "平静"
+    energy: int = 70
+    reason: str = ""
+    updated: float = 0.0
+
+
+def load_mood(group_id: str) -> Mood:
+    try:
+        row = db.execute(
+            "SELECT name, energy, reason, updated FROM bot_mood WHERE group_id=?",
+            (group_id,),
+        ).fetchone()
+    except Exception:
+        logger.exception("读取心情失败")
+        return Mood()
+    if not row:
+        return Mood(updated=time.time())
+    return Mood(str(row[0]), int(row[1]), str(row[2]), float(row[3]))
+
+
+def save_mood(group_id: str, mood: Mood) -> None:
+    try:
+        db.execute(
+            "INSERT INTO bot_mood(group_id,name,energy,reason,updated) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(group_id) DO UPDATE SET name=excluded.name, "
+            "energy=excluded.energy, reason=excluded.reason, updated=excluded.updated",
+            (group_id, mood.name, mood.energy, mood.reason, mood.updated),
+        )
+        db.commit()
+    except Exception:
+        logger.exception("保存心情失败")
+
+
+def touch_mood(group_id: str, st: "GroupState", msg: Msg, *, direct: bool) -> None:
+    """每条消息都过一遍：精力随时间掉，被夸/被骂/聊到难过的事会改心情。"""
+    now = time.time()
+    hour = datetime.fromtimestamp(now, TZ).hour
+    old = st.mood or Mood(updated=now)
+    elapsed_hours = max(0.0, now - old.updated) / 3600
+    if elapsed_hours > 8:
+        # 隔了一夜，睡醒了
+        energy = random.randint(55, 85)
+    else:
+        energy = max(20, int(old.energy - elapsed_hours * 6))
+
+    name, reason = mood_from_event(
+        msg.text,
+        direct=direct,
+        hour=hour,
+        energy=energy,
+        current=old.name,
+    )
+    # 半小时没任何事，慢慢回到平静
+    if not reason and now - old.updated > 1800 and old.name not in ("平静", "困"):
+        name, reason = "平静", ""
+
+    mood = Mood(name=name, energy=energy, reason=reason, updated=now)
+    st.mood = mood
+    changed = (
+        name != old.name
+        or reason != old.reason
+        or abs(energy - old.energy) >= 5
+    )
+    if changed:
+        save_mood(group_id, mood)
 
 
 MESSAGE_KEEP_DAYS = 90
@@ -733,6 +1028,8 @@ class GroupState:
     queued: Msg | None = None
     log: deque = field(default_factory=lambda: deque(maxlen=30))
     last_event: float = 0.0
+    last_search: float = 0.0
+    mood: "Mood | None" = None
 
 
 group_state: dict[str, GroupState] = {}
@@ -748,6 +1045,7 @@ def state_for(group_id: str) -> GroupState:
             notes=load_notes(group_id),
             aliases=load_aliases(group_id),
             diary=load_diary(group_id),
+            mood=load_mood(group_id),
         )
         group_state[group_id] = st
     return st
@@ -1045,6 +1343,17 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if memory_enabled(group_id, msg.user_id):
         save_message(group_id, msg)
 
+    # 心情随互动变化：被夸会开心，被凶会烦躁，聊到难过的事会低落
+    try:
+        touch_mood(
+            group_id,
+            st,
+            msg,
+            direct=_is_direct(msg, str(event.self_id), names),
+        )
+    except Exception:
+        logger.exception("更新心情失败")
+
     st.counter += 1
     if NOTES_ENABLED and st.counter % NOTES_EVERY == 0:
         eligible = [
@@ -1195,6 +1504,44 @@ async def _produce(bot: Bot, st: GroupState, group_id: str) -> None:
         except Exception:
             logger.exception("召回旧消息失败")
 
+    # 此刻的心情 + 这一条的语境：让每轮的语气不一样
+    hour = datetime.fromtimestamp(time.time(), TZ).hour
+    bot_id = str(bot.self_id)
+    direct = bool(
+        last_in
+        and (
+            bot_id in last_in.at_ids
+            or last_in.reply_to_user == bot_id
+            or PERSONA_NAME in (last_in.text or "")
+        )
+    )
+    mood = st.mood or Mood()
+    mode = pick_mode(last_in.text if last_in else "", hour, direct=direct)
+    state_text = render_state(mood.name, mood.energy, mood.reason, mode)
+
+    # 需要外部信息时才联网，且每群两分钟一次
+    search_text = ""
+    if (
+        SEARCH_ENABLED
+        and last_in
+        and last_in.text
+        and need_search(last_in.text)
+        and time.time() - st.last_search > SEARCH_COOLDOWN
+    ):
+        st.last_search = time.time()
+        query = clean_query(last_in.text)
+        data = await asyncio.to_thread(search_web, query)
+        if data.get("answer") or data.get("results"):
+            search_text = format_search(data)
+            top = (data.get("results") or [{}])[0].get("title", "")
+            logger.info(
+                "搜索「{}」→ {} 条{}｜首条：{}",
+                query,
+                len(data.get("results") or []),
+                "（有摘要）" if data.get("answer") else "",
+                str(top)[:30],
+            )
+
     base = build_messages(
         name=PERSONA_NAME,
         context=context,
@@ -1205,6 +1552,8 @@ async def _produce(bot: Bot, st: GroupState, group_id: str) -> None:
         aliases=st.aliases,
         diary=st.diary,
         recall=recalled,
+        state=state_text,
+        search=search_text,
     )
 
     cap = max(2, target)
@@ -1297,6 +1646,93 @@ async def _produce(bot: Bot, st: GroupState, group_id: str) -> None:
         st.recent_replies.extend(sent)
         STATS["reply"] += len(sent)
         logger.info("发言 {} -> {}", group_id, " | ".join(sent))
+
+
+# --------------------------------------------------------------------------- 自言自语
+
+async def _maybe_selftalk() -> None:
+    """群里安静太久时，偶尔自己冒一句。像人待着待着突然嘟囔。"""
+    if not SELFTALK_ENABLED:
+        return
+    bots = nonebot.get_bots()
+    if not bots:
+        return
+    bot = next(iter(bots.values()))
+    now = time.time()
+    hour = datetime.fromtimestamp(now, TZ).hour
+    if hour < 7 or hour >= 24:
+        return
+    for group_id, st in list(group_state.items()):
+        if st.task is not None and not st.task.done():
+            continue
+        if now - st.last_event < SELFTALK_IDLE_SECONDS:
+            continue
+        if now - st.last_bot_reply < SELFTALK_GAP_SECONDS:
+            continue
+        if random.random() > SELFTALK_RATE:
+            continue
+        await _say_to_self(bot, st, group_id)
+        return
+
+
+async def _say_to_self(bot: Bot, st: GroupState, group_id: str) -> None:
+    now = time.time()
+    mood = st.mood or Mood()
+    idle = int((now - st.last_event) / 60)
+    context = (
+        f"（现在 {datetime.fromtimestamp(now, TZ).strftime('%H:%M')}，"
+        f"群里已经 {idle} 分钟没人说话了）\n\n"
+        "你一个人待着，突然想说一句。只说一句，别 @ 人，别问问题，"
+        "别解释为什么突然说话，也不要提“没人说话”。"
+    )
+    base = build_messages(
+        name=PERSONA_NAME,
+        context=context,
+        notes=st.notes,
+        diary=st.diary,
+        state=render_state(mood.name, mood.energy, mood.reason, "日常"),
+        bubbles=1,
+    )
+    cleaned = await _generate(base, max_bubbles=1)
+    if not cleaned:
+        return
+    for kind, value in cleaned.items:
+        if kind != "text":
+            continue
+        try:
+            await asyncio.wait_for(
+                bot.send_group_msg(group_id=int(group_id), message=value), timeout=15
+            )
+        except Exception:
+            logger.exception("自言自语发送失败")
+            return
+        st.messages.append(
+            Msg(
+                ts=time.time(),
+                user_id=str(bot.self_id),
+                nickname=PERSONA_NAME,
+                text=value,
+                is_self=True,
+            )
+        )
+        st.last_bot_reply = time.time()
+        st.recent_replies.append(value)
+        logger.info("自言自语 {} -> {}", group_id, value)
+
+
+async def _selftalk_loop() -> None:
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await _maybe_selftalk()
+        except Exception:
+            logger.exception("自言自语循环出错")
+
+
+@driver.on_startup
+async def _start_selftalk() -> None:
+    if SELFTALK_ENABLED:
+        spawn(_selftalk_loop())
 
 
 # --------------------------------------------------------------------------- 私聊
@@ -1511,9 +1947,11 @@ async def handle_status(event: MessageEvent) -> None:
         lines.append("还没收到过群消息")
     for gid, st in list(group_state.items())[:5]:
         busy = "忙" if st.task is not None and not st.task.done() else "闲"
+        mood = st.mood or Mood()
         lines.append(
             f"群 {gid}｜缓存 {len(st.messages)} 条｜外号 {len(st.aliases)} 条"
             f"｜备忘 {len(st.diary)} 字"
+            f"｜心情 {mood.name}/{mood.energy}"
             f"｜上次收到 {_fmt_ts(st.last_event)}"
             f"｜上次发言 {_fmt_ts(st.last_bot_reply)}｜{busy}"
         )
